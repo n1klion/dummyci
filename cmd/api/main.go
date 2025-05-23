@@ -2,8 +2,10 @@ package main
 
 import (
 	"archive/tar"
+	"bufio"
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,8 +21,11 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 	"github.com/moby/buildkit/session"
+	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 )
@@ -91,7 +96,7 @@ func pullRepository(repo string, branch string) (string, error) {
 	return randomName, nil
 }
 
-func dockerBuild(repo string, name string) error {
+func dockerBuild(repo string, name string) (string, error) {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		log.Fatal(err)
@@ -102,7 +107,7 @@ func dockerBuild(repo string, name string) error {
 
 	buildContext, err := createBuildContext(dir)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	log.Debugf("Building docker image for repository: %s", repo)
@@ -112,7 +117,7 @@ func dockerBuild(repo string, name string) error {
 
 	s, err := session.NewSession(ctx, "buildkit-session")
 	if err != nil {
-		return fmt.Errorf("failed to create buildkit session: %w", err)
+		return "", fmt.Errorf("failed to create buildkit session: %w", err)
 	}
 
 	dialer := func(ctx context.Context, proto string, meta map[string][]string) (net.Conn, error) {
@@ -131,25 +136,60 @@ func dockerBuild(repo string, name string) error {
 		SessionID:   s.ID(),
 		Version:     types.BuilderBuildKit,
 		PullParent:  true,
+		NoCache:     true,
 	})
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer resp.Body.Close()
 
-	if _, err := io.Copy(os.Stdout, resp.Body); err != nil {
+	buildID, err := readBuildLog(resp.Body)
+	if err != nil {
 		cancel()
-		return fmt.Errorf("failed to read build output: %w", err)
+		return "", fmt.Errorf("failed to copy response body: %w", err)
 	}
 
 	cancel()
 	if err := eg.Wait(); err != nil && err != context.Canceled {
-		return fmt.Errorf("session error: %w", err)
+		return "", fmt.Errorf("session error: %w", err)
 	}
 
 	log.Infof("Built docker image for repository: %s successfully", repo)
 
-	return nil
+	return buildID, nil
+}
+
+func readBuildLog(respBody io.Reader) (string, error) {
+	// TODO parse buildx proto output
+	var buildID string
+	scanner := bufio.NewScanner(respBody)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+
+		var msg map[string]interface{}
+		err := json.Unmarshal(line, &msg)
+		if err != nil {
+			return "", err
+		}
+
+		id, ok := msg["id"]
+		if !ok {
+			return "", fmt.Errorf("no id in message: %s", string(line))
+		}
+
+		if id.(string) == "moby.image.id" {
+			bid, ok := msg["aux"].(map[string]interface{})["ID"]
+			if !ok {
+				return "", fmt.Errorf("no aux.ID in message: %s", string(line))
+			}
+			log.Debugf("Buildkit image ID: %s", buildID)
+			buildID = bid.(string)
+		}
+
+		log.Debug(string(line))
+
+	}
+	return buildID, scanner.Err()
 }
 
 func createBuildContext(dir string) (io.Reader, error) {
@@ -214,7 +254,7 @@ func debugHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer deleteClonedRepositoryDir(repoName)
 
-	err = dockerBuild("n1klion/budget", repoName)
+	buildID, err := dockerBuild("n1klion/budget", repoName)
 	if err != nil {
 		log.Errorf("Failed to build docker image for repository: %s", err)
 		w.WriteHeader(http.StatusInternalServerError)
@@ -222,8 +262,49 @@ func debugHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	err = runImage("n1klion/budget", buildID)
+	if err != nil {
+		log.Errorf("Failed to run docker image for repository: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte("Internal server error"))
+		return
+	}
+
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("OK"))
+}
+
+func runImage(repo string, buildID string) error {
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer cli.Close()
+
+	log.Debugf("INPUT IMAGE NAME: %s", buildID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute*15)
+	defer cancel()
+
+	resp, err := cli.ContainerCreate(
+		ctx,
+		&container.Config{
+			Image: buildID,
+		},
+		&container.HostConfig{
+			AutoRemove: false,
+		},
+		&network.NetworkingConfig{},
+		&v1.Platform{},
+		"budget",
+	)
+	if err != nil {
+		return err
+	}
+
+	log.Debugf("Create container response: %+v", resp)
+
+	return cli.ContainerStart(ctx, resp.ID, container.StartOptions{})
 }
 
 func commitTriggerHandler(w http.ResponseWriter, r *http.Request) {
